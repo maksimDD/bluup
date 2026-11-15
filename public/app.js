@@ -1,0 +1,311 @@
+const $ = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+const toast = msg => { const el=$('#toast'); if(!el)return; el.textContent=msg; el.classList.add('show'); clearTimeout(window.__toastTimer); window.__toastTimer=setTimeout(()=>el.classList.remove('show'),3200); };
+const openModal = id => { const el=$('#'+id); if(!el)return; el.classList.add('open'); el.setAttribute('aria-hidden','false'); document.body.style.overflow='hidden'; };
+const closeModal = id => { const el=$('#'+id); if(!el)return; el.classList.remove('open'); el.setAttribute('aria-hidden','true'); if (!$('.modal-backdrop.open')) document.body.style.overflow=''; };
+
+if ($('#year')) $('#year').textContent = new Date().getFullYear();
+
+if ($('#menuToggle')) {
+  $('#menuToggle').addEventListener('click',()=>$('#nav').classList.toggle('open'));
+}
+$$('.nav-link').forEach(a=>a.addEventListener('click',()=>{$$('.nav-link').forEach(x=>x.classList.remove('active'));a.classList.add('active');$('#nav').classList.remove('open')}));
+
+if ($('#reviewsNav')) $('#reviewsNav').addEventListener('click',e=>{e.preventDefault();$('#nav').classList.remove('open');openModal('reviewsBackdrop');});
+if ($('#reviewsClose')) $('#reviewsClose').addEventListener('click',()=>closeModal('reviewsBackdrop'));
+
+const userChip=$('#userChip'), loginBtn=$('#loginBtn');
+async function readApiJson(response, label='API') {
+  const type = response.headers.get('content-type') || '';
+  const raw = await response.text();
+  if (!type.includes('application/json')) {
+    if (/<!doctype html|<html/i.test(raw)) throw new Error(`${label}: сервер вернул HTML вместо JSON. Похоже, на Amvera запущена старая версия backend или API-маршрут не попадает в Node.js. Перезагрузите приложение и проверьте deployment.`);
+    throw new Error(`${label}: сервер вернул неожиданный формат ответа.`);
+  }
+  try { return raw ? JSON.parse(raw) : {}; }
+  catch { throw new Error(`${label}: сервер вернул некорректный JSON.`); }
+}
+
+let blockedNotified=false;
+
+async function api(url, options={}) { const r=await fetch(url,{...options,headers:{...(options.body?{'Content-Type':'application/json'}:{}),...(options.headers||{})}}); const d=await r.json().catch(()=>({})); if(!r.ok) throw new Error(d.error||'Ошибка запроса'); return d; }
+
+async function refreshUser(){
+  try{
+    const d=await api('/api/me');
+    if(d.nickname){
+      userChip.classList.remove('hidden');$('#userName').textContent=d.nickname;loginBtn.classList.add('hidden');
+    }else{
+      userChip.classList.add('hidden');loginBtn.classList.remove('hidden');
+    }
+  }catch(e){
+    userChip.classList.add('hidden');loginBtn.classList.remove('hidden');
+    if((e.message||'').includes('заблокирован')&&!blockedNotified){blockedNotified=true;toast(e.message)}
+  }
+}
+
+async function refreshConfig(){
+  try{
+    const c=await api('/api/config');
+    const money=n=>Number(n||0).toLocaleString('ru-RU',{maximumFractionDigits:2});
+    const dealRate=$('#dealRate');
+    if(dealRate)dealRate.textContent=c.usdtRate>0?`| ${money(200*c.usdtRate)} ₽`:'| сумма в рублях';
+    const usdtRateDisplay=$('#usdtRateDisplay'),gramRateDisplay=$('#gramRateDisplay');
+    if(usdtRateDisplay)usdtRateDisplay.textContent=c.usdtRate>0?`${money(c.usdtRate)} ₽`:'не задан';
+    if(gramRateDisplay)gramRateDisplay.textContent=c.gramRate>0?`${money(c.gramRate)} ₽`:'не задан';
+    window.blupBanks=c.banks||[];window.blupWallets=c.wallets||{};window.blupRates={USDT:c.usdtRate,GRAM:c.gramRate};
+  }catch{}
+}
+refreshUser();refreshConfig();
+if(new URLSearchParams(location.search).get('login')==='1'){setTimeout(()=>openModal('authBackdrop'),250);}
+
+async function refreshMaintenance(){
+ try{
+  const d=await api('/api/status');
+  const screen=$('#maintenanceScreen');
+  if(screen) screen.classList.toggle('hidden',!d.stopped);
+ }catch{}
+}
+refreshMaintenance();
+setInterval(refreshMaintenance,10000);
+setInterval(refreshUser,15000);
+
+// Интерактивная 3D-карта BLUP.
+(function enableCardDrag(){
+ const card=document.querySelector('.glass-card');
+ if(!card)return;
+ let active=false,startX=0,startY=0,rotX=13,rotY=-28,baseX=0,baseY=0;
+ card.style.touchAction='none';
+ card.setAttribute('role','img');
+ card.setAttribute('aria-label','Интерактивная 3D-карта BLUP.');
+ card.addEventListener('pointerdown',e=>{
+   active=true;startX=e.clientX;startY=e.clientY;baseX=rotY;baseY=rotX;
+   card.classList.add('is-dragging');card.style.animation='none';
+   card.style.cursor='grabbing';card.setPointerCapture?.(e.pointerId);e.preventDefault();
+ });
+ card.addEventListener('pointermove',e=>{if(!active)return;
+   rotY=baseX+(e.clientX-startX)*.72;rotX=Math.max(-65,Math.min(65,baseY-(e.clientY-startY)*.62));
+   card.style.transform=`rotateY(${rotY}deg) rotateX(${rotX}deg) rotateZ(-3deg) translateZ(28px)`;
+ });
+ const release=()=>{if(!active)return;active=false;card.style.cursor='grab';card.classList.remove('is-dragging');
+   // После ручного вращения возвращаем плавное автономное движение.
+   window.setTimeout(()=>{if(!active){card.style.removeProperty('animation');card.style.removeProperty('transform');}},1800);
+ };
+ card.addEventListener('pointerup',release);card.addEventListener('pointercancel',release);
+ card.addEventListener('lostpointercapture',release);
+ card.style.cursor='grab';
+})();
+
+// ==========================================
+// ОПЕРАЦИИ (ПРОДАЖА)
+// ==========================================
+let operationType='sell';
+const operationFields=$('#operationFields');
+function labelInput(label,name,placeholder,type='text',full=false,required=true){return `<label class="${full?'full':''}">${label}<input name="${name}" type="${type}" placeholder="${placeholder}" ${required?'required':''} ${type==='number'?'min="0.01" step="0.01"':''}></label>`;}
+function labelSelect(label,name,options,full=false){return `<label class="${full?'full':''}">${label}<select name="${name}" required>${options.map((x,i)=>`<option value="${escapeHtml(x.value)}" ${i===0?'selected':''}>${escapeHtml(x.label)}</option>`).join('')}</select></label>`;}
+function bankOptions(){const banks=window.blupBanks?.length?window.blupBanks:['Сбербанк','Т-Банк','ВТБ','Альфа-Банк','Газпромбанк'];return banks.map(b=>({value:b,label:`${bankIcon(b)}  ${b}`}));}
+function bankIcon(name){const n=name.toLowerCase();if(n.includes('сбер'))return '🟢';if(n.includes('т-')||n.includes('тинь'))return '🟡';if(n.includes('втб'))return '🔵';if(n.includes('альфа'))return '🔴';if(n.includes('газпром'))return '💠';if(n.includes('озон'))return '🟣';return '🏦';}
+function walletFor(coin,network){return window.blupWallets?.[coin]?.[network]||'';}
+function walletPanel(coin,network){const address=walletFor(coin,network);return `<div class="wallet-panel full"><span>КОШЕЛЁК BLUP · ${escapeHtml(network)}</span><b>${escapeHtml(address||'Адрес не найден')}</b><button type="button" class="copy-wallet" data-copy-wallet="${escapeHtml(address)}">Копировать адрес</button></div>`;}
+
+let selectedCoin='TON', selectedNetwork='TON';
+function renderCryptoChoice(){
+ const coin=$('#sellCoin'),network=$('#sellNetwork');
+ if(!coin||!network)return;
+ const renderNetworks=()=>{
+  selectedCoin=coin.value;
+  const nets=selectedCoin==='USDT'?['TRC20','BEP20','ERC20','TON','SPL']:['TON'];
+  network.innerHTML=nets.map(n=>`<option value="${n}">${n}</option>`).join('');
+  selectedNetwork=nets[0];updateDepositWallet();
+ };
+ coin.addEventListener('change',renderNetworks);
+ network.addEventListener('change',()=>{selectedNetwork=network.value;updateDepositWallet();});
+ renderNetworks();
+}
+function updateDepositWallet(){
+ const coin=selectedCoin==='TON'?'GRAM':'USDT';
+ $('#sellCryptoWallet').innerHTML=walletPanel(coin,selectedNetwork);
+ $('#cryptoSentConfirm').checked=false;$('#goToApplication').disabled=true;
+}
+function renderOperationFields(){
+ if(!operationFields)return;
+ const isTon=selectedCoin==='TON',unit=isTon?'TON':'USDT',rateKey=isTon?'GRAM':'USDT';
+ operationFields.innerHTML=`${labelInput(`Сумма для продажи (${unit})`,'amount',isTon?'Например, 10':'Например, 100','number',true)}<div id="rubPreview" class="field-note full">Итого к выплате: укажи сумму в ${unit}</div><div id="discountOffer" class="field-note full hidden"></div>${labelSelect('Куда отправить выплату','payoutType',[{value:'phone',label:'На номер телефона (СБП)'},{value:'card',label:'На банковскую карту'}])}${labelInput('Номер телефона или карты','payoutValue','Без CVV и срока действия','text',true)}${labelSelect('Банк получателя','bank',bankOptions(),true)}${labelInput('Telegram username','telegramUsername','Например, @username','text',true)}${labelInput('Комментарий к продаже','comment','Комментарий (необязательно)','text',true,false)}<p class="field-note full">Сумма заявки указывается в ${unit}. После отправки заявки администратор проверит поступление криптовалюты и вручную отправит рубли. Не вводи CVV, PIN или SMS-коды.</p>`;
+ const amountInput=operationFields.querySelector('[name="amount"]');amountInput.min=isTon?'0.000000001':'0.01';amountInput.step=isTon?'0.000000001':'0.01';if(!isTon){amountInput.max='200';amountInput.placeholder='До 200 USDT';}
+ let discountPercent=0;
+ function updateRub(){const rate=Number(window.blupRates?.[rateKey]||0),amount=Number(amountInput.value||0);const base=amount*rate;const apply=!!operationFields.querySelector('#applyDiscount')?.checked;const total=base*(apply?1+discountPercent/100:1);$('#rubPreview').textContent=rate>0&&amount>0?`Курс: ${rate.toLocaleString('ru-RU')} ₽ за 1 ${unit}. Итого к выплате: ${total.toLocaleString('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2})} ₽`:`Итого к выплате: укажи сумму в ${unit}`;}
+ amountInput.addEventListener('input',updateRub);
+ if($('#userName').textContent){api('/api/profile').then(profile=>{const manual=Number(profile.discount_percent||0);const coupon=(profile.coupons||[]).reduce((m,c)=>Math.max(m,Number(c.percent)||0),0);discountPercent=Math.max(manual,coupon);if(discountPercent){const isCoupon=coupon>=manual&&coupon>0;$('#discountOffer').classList.remove('hidden');$('#discountOffer').innerHTML=`У тебя есть ${isCoupon?'одноразовый купон':'скидка'} <b>${discountPercent}%</b>. <label><input type="checkbox" id="applyDiscount"> Применить ${discountPercent}% к этой продаже${isCoupon?' (купон сгорит)':''}</label>`;$('#applyDiscount').addEventListener('change',updateRub);}updateRub();}).catch(updateRub);}else updateRub();
+}
+function setSellStep(step){const first=step===1;$('#sellStep1').classList.toggle('hidden',!first);$('#sellStep2').classList.toggle('hidden',first);$('#sellStepTab1').classList.toggle('active',first);$('#sellStepTab2').classList.toggle('active',!first);}
+function showOperation(){
+ operationType='sell';$('#operationMessage').textContent='';$('#modalEyebrow').textContent='BLUP / ПРОДАЖА';$('#modalTitle').textContent='Продажа криптовалюты';$('#modalDesc').textContent='Выбери TON или USDT и сеть, отправь криптовалюту, затем заполни заявку.';
+ $('#sellCoin').value='TON';renderCryptoChoice();$('#cryptoSentConfirm').checked=false;$('#goToApplication').disabled=true;setSellStep(1);renderOperationFields();$('#operationSubmitBtn').textContent='ПОДАТЬ ЗАЯВКУ';openModal('modalBackdrop');
+}
+$$('[data-open="sell"]').forEach(b=>b.addEventListener('click',showOperation));
+$('#cryptoSentConfirm')?.addEventListener('change',e=>$('#goToApplication').disabled=!e.target.checked);
+$('#goToApplication')?.addEventListener('click',()=>{if(!$('#cryptoSentConfirm').checked)return;renderOperationFields();setSellStep(2);});
+$('#backToCrypto')?.addEventListener('click',()=>setSellStep(1));
+$('#sellCryptoWallet')?.addEventListener('click',e=>{const b=e.target.closest('[data-copy-wallet]');if(b&&b.dataset.copyWallet)navigator.clipboard?.writeText(b.dataset.copyWallet).then(()=>toast('Адрес скопирован')).catch(()=>toast('Не удалось скопировать адрес'));});
+if(operationFields){operationFields.addEventListener('click',e=>{const b=e.target.closest('[data-copy-wallet]');if(b&&b.dataset.copyWallet)navigator.clipboard?.writeText(b.dataset.copyWallet).then(()=>toast('Адрес скопирован')).catch(()=>toast('Не удалось скопировать адрес'));});}
+if($('#operationForm'))$('#operationForm').addEventListener('submit',async e=>{e.preventDefault();const form=e.currentTarget;if(!$('#userName').textContent){closeModal('modalBackdrop');openModal('authBackdrop');toast('Сначала войди через Telegram');return;}const payload=Object.fromEntries(new FormData(form).entries());payload.applyDiscount=!!form.querySelector('#applyDiscount')?.checked;payload.coin=selectedCoin;payload.network=selectedNetwork;$('#operationMessage').textContent='Отправляем заявку…';try{const d=await api('/api/sell',{method:'POST',body:JSON.stringify(payload)});$('#operationMessage').textContent='';form.reset();closeModal('modalBackdrop');toast(`Заявка №${d.id} отправлена`);refreshConfig();}catch(err){$('#operationMessage').textContent=err.message;}});
+
+// ==========================================
+// АВТОРИЗАЦИЯ И ИСТОРИЯ
+// ==========================================
+if (loginBtn) {
+  loginBtn.addEventListener('click', () => { openModal('authBackdrop'); if($('#authMessage')) $('#authMessage').textContent=''; });
+}
+
+async function showHistory(){
+  openModal('historyBackdrop');
+  const box=$('#historyContent');
+  box.innerHTML='<div class="empty-state"><small>Загружаем историю…</small></div>';
+  try{
+    const rows=await api('/api/history');
+    if(!rows.length){
+      box.innerHTML='<div class="empty-state"><span>◷</span><b>Здесь пока пусто</b><small>Твои заявки появятся здесь после отправки.</small></div>';
+      return;
+    }
+    box.innerHTML=rows.map(x=>`<div class="history-row"><div><b>${escapeHtml(x.coin||'Операция')}</b><small>${escapeHtml(x.network||'—')}</small></div><div><b>${'Продажа'}</b><small>${escapeHtml(x.status||'pending')}</small></div><div><b>${formatDate(x.created_at)}</b><small>${x.amount?escapeHtml(x.amount)+(x.coin==='GRAM'?' TON':' USDT'):'Заявка №'+x.id}</small></div></div>`).join('');
+  }catch(err){
+    box.innerHTML=`<div class="empty-state"><b>${escapeHtml(err.message)}</b></div>`;
+  }
+}
+if ($('#historyBtn')) $('#historyBtn').addEventListener('click',showHistory);
+if ($('#historyCardBtn')) $('#historyCardBtn').addEventListener('click',showHistory);
+
+[['modalClose','modalBackdrop'],['authClose','authBackdrop'],['historyClose','historyBackdrop'],['reviewsClose','reviewsBackdrop'],['termsClose','termsBackdrop'],['privacyClose','privacyBackdrop']].forEach(([btn,id])=>{
+  if($('#'+btn)) $('#'+btn).addEventListener('click',()=>closeModal(id));
+});
+
+$$('.modal-backdrop').forEach(b=>b.addEventListener('click',e=>{if(e.target===b)closeModal(b.id)}));
+document.addEventListener('keydown',e=>{if(e.key==='Escape')$$('.modal-backdrop.open').forEach(m=>closeModal(m.id))});
+$$('[data-placeholder]').forEach(a=>a.addEventListener('click',e=>{e.preventDefault();toast('Контакт или документ будет добавлен перед запуском сервиса.')}));
+
+// Открытие юридических модалок
+if ($('#footerTerms')) $('#footerTerms').addEventListener('click', (e) => { e.preventDefault(); openModal('termsBackdrop'); });
+if ($('#footerPrivacy')) $('#footerPrivacy').addEventListener('click', (e) => { e.preventDefault(); openModal('privacyBackdrop'); });
+
+
+if ($('#logoutBtn')) {
+  $('#logoutBtn').addEventListener('click',async()=>{
+    try{await api('/api/logout',{method:'POST'});await refreshUser();toast('Ты вышел из аккаунта')}
+    catch{toast('Не удалось выйти')}
+  });
+}
+
+function escapeHtml(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function formatDate(v){if(!v)return '—';const d=new Date(v.replace(' ','T')+'Z');return isNaN(d)?escapeHtml(v):d.toLocaleString('ru-RU',{dateStyle:'short',timeStyle:'short'})}
+
+// ==========================================
+// ВХОД ЧЕРЕЗ TELEGRAM (ОДНА КНОПКА)
+// ==========================================
+const tgLoginBtn = $('#tgLoginBtn');
+if (tgLoginBtn) {
+  tgLoginBtn.addEventListener('click', async () => {
+    const msgEl = $('#authMessage');
+    if (msgEl) msgEl.textContent = 'Загрузка Telegram…';
+
+    // Ждём появления объекта Telegram (до 5 секунд)
+    let waited = 0;
+    while ((!window.Telegram || !window.Telegram.Login) && waited < 5000) {
+      await new Promise(r => setTimeout(r, 100));
+      waited += 100;
+    }
+
+    if (!window.Telegram || !window.Telegram.Login || !window.Telegram.Login.auth) {
+      if (msgEl) msgEl.textContent = 'Telegram не загрузился. Проверьте, не блокирует ли его AdBlock, и обновите страницу.';
+      return;
+    }
+
+    if (msgEl) msgEl.textContent = '';
+
+    try {
+      const r = await fetch('/api/auth/telegram/config');
+      const config = await readApiJson(r, 'Настройки Telegram');
+      if (!r.ok) throw new Error(config.error || 'Telegram-вход не настроен');
+
+      window.Telegram.Login.auth(
+        { bot_id: config.botId, request_access: 'write', lang: 'ru' },
+        async (user) => {
+          if (!user) { if (msgEl) msgEl.textContent = 'Вход отменён'; return; }
+          try {
+            const authRes = await fetch('/api/auth/telegram', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify(user)
+            });
+            const d = await readApiJson(authRes, 'Авторизация Telegram');
+            if (!authRes.ok) throw new Error(d.error || 'Ошибка Telegram-входа');
+            closeModal('authBackdrop');
+            await refreshUser();
+            toast('Вход через Telegram выполнен');
+            location.href = '/profile';
+          } catch (e) { if (msgEl) msgEl.textContent = e.message; }
+        }
+      );
+    } catch (e) {
+      if (msgEl) msgEl.textContent = e.message;
+    }
+  });
+}
+
+async function refreshOnline() {
+  try {
+    const r = await fetch('/api/real-online', { cache: 'no-store', credentials: 'same-origin' });
+    if (!r.ok) throw new Error('Не удалось обновить онлайн');
+    const d = await r.json();
+    const countEl = $('#onlineCount');
+    if (countEl && Number.isFinite(Number(d.online))) countEl.textContent = String(Math.max(0, Number(d.online)));
+  } catch (e) {
+    // При временной ошибке оставляем последнее известное значение,
+    // вместо того чтобы ошибочно показывать ноль.
+  }
+}
+refreshOnline();
+setInterval(refreshOnline, 20000); // Heartbeat каждые 20 секунд
+
+// ==========================================
+// ЛОГИКА ВХОДА (ЛОГИН/ПАРОЛЬ И TG)
+// ==========================================
+let authMode = 'login';
+
+const tabLogin = $('#tabLogin');
+const tabRegister = $('#tabRegister');
+const authForm = $('#authForm');
+
+function setAuthMode(mode) {
+  authMode = mode;
+  if (tabLogin) tabLogin.classList.toggle('selected', mode === 'login');
+  if (tabRegister) tabRegister.classList.toggle('selected', mode === 'register');
+  if ($('#authTitle')) $('#authTitle').textContent = mode === 'login' ? 'Вход в аккаунт' : 'Создать аккаунт';
+  if ($('#authSubmit')) $('#authSubmit').innerHTML = (mode === 'login' ? 'Войти' : 'Зарегистрироваться') + ' <span>↗</span>';
+  if ($('#passwordHint')) $('#passwordHint').textContent = mode === 'register' ? 'Для нового аккаунта пароль должен быть не короче 10 символов.' : '';
+  if ($('#authMessage')) $('#authMessage').textContent = '';
+  if (authForm) authForm.querySelector('[name="password"]').minLength = mode === 'register' ? 10 : 4;
+}
+
+if (tabLogin) tabLogin.addEventListener('click', () => setAuthMode('login'));
+if (tabRegister) tabRegister.addEventListener('click', () => setAuthMode('register'));
+
+if (authForm) {
+  authForm.addEventListener('submit', async e => {
+    e.preventDefault();
+    const form = e.currentTarget;
+    const f = new FormData(form);
+    if ($('#authMessage')) $('#authMessage').textContent = 'Проверяем данные…';
+    try {
+      const endpoint = authMode === 'login' ? '/api/login' : '/api/register';
+      await api(endpoint, { method: 'POST', body: JSON.stringify(Object.fromEntries(f.entries())) });
+      closeModal('authBackdrop');
+      await refreshUser();
+      toast(authMode === 'login' ? 'Ты вошёл в аккаунт' : 'Аккаунт создан');
+      form.reset();
+    } catch (err) {
+      if ($('#authMessage')) $('#authMessage').textContent = err.message;
+    }
+  });
+}
+
+(async function(){const root=document.getElementById('publicReviews');if(!root)return;try{const r=await fetch('/api/reviews');const rows=await r.json();const safe=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));root.innerHTML=rows.map(x=>`<article class="review-card"><div class="review-card-top"><b>${safe(x.username)}</b><span class="review-stars">${'★'.repeat(x.stars)}${'☆'.repeat(5-x.stars)}</span></div><div class="review-sale">Продал на ${Number(x.sale_amount).toLocaleString('ru-RU')} ₽</div><p>${safe(x.review_text)}</p><small>${new Date(x.created_at).toLocaleDateString('ru-RU')}</small></article>`).join('')||'<p class="reviews-empty">Пока отзывов нет.</p>';}catch{root.innerHTML='<p>Не удалось загрузить отзывы.</p>';}})();;
